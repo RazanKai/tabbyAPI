@@ -37,7 +37,10 @@ class TokenEncodeEndpointTests(unittest.IsolatedAsyncioTestCase):
             patch.object(router.model, "container", container),
             patch.object(router, "format_messages_with_template", formatter),
         ):
-            response = await router.encode_tokens(request)
+            # The reader-pin integration added a `request` parameter; the pin is
+            # a no-op with no installed coordinator (disabled mode in tests).
+            fake_request = SimpleNamespace(state=SimpleNamespace(id="test-req"))
+            response = await router.encode_tokens(fake_request, request)
 
         formatter.assert_awaited_once_with(
             request.text,

@@ -72,6 +72,16 @@ async def entrypoint_async():
             "Set override_preset to safe_defaults unless this is intentional."
         )
 
+    # Orchestration gate (R01/R13): enabled mode rejects a startup model load
+    # (it would bypass admission) and requires the orchestrator to be
+    # installable before anything else touches the GPU.
+    from orchestration.config import ConfigurationError
+    from orchestration.install import enable, shutdown as orchestrator_shutdown
+
+    orchestrator_enabled = bool(config.orchestrator.enabled)
+    if orchestrator_enabled:
+        enable()  # raises ConfigurationError on an unusable configuration
+
     # If an initial model name is specified, create a container
     # and load the model
     model_name = config.model.model_name
@@ -119,7 +129,12 @@ async def entrypoint_async():
         await status_display.stop()
 
     # Uvicorn has finished serving; unload any loaded models so pending
-    # jobs are cancelled and the generator is closed cleanly
+    # jobs are cancelled and the generator is closed cleanly.
+    # Orchestrated mode: the coordinator owns the drain (R13) — close
+    # admission, fail waiters, and wait for owned work before teardown.
+    if orchestrator_enabled:
+        await orchestrator_shutdown()
+
     if model.container:
         await model.unload_model(skip_wait=True, shutdown=True)
 
@@ -151,6 +166,15 @@ def entrypoint(
         args = parser.parse_args()
 
     dict_args = convert_args_to_dict(args, parser)
+
+    # Register the orchestrator config section BEFORE config.load: upstream's
+    # file/arg/env loaders iterate TabbyConfigModel.model_fields, so a section
+    # registered after load would silently drop the user's `orchestrator:` keys
+    # (unknown keys are ignored — integration map §6). Registration itself is a
+    # no-op for a plain upstream deployment (R14).
+    from orchestration.install import install_config_section
+
+    install_config_section()
 
     # load config
     config.load(dict_args)

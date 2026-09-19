@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sse_starlette import EventSourceResponse
 
 from common import model
 from common.auth import check_api_key
 from common.model import check_model_container
 from common.networking import get_sse_ping_interval
+from common.tabby_config import config
 from common.utils import unwrap
 from endpoints.core.utils.model import get_current_model
 from endpoints.Kobold.types.generation import (
@@ -36,6 +37,18 @@ extra_kai_router = APIRouter()
 
 
 def setup():
+    # R12/T13: the Kobold surface is out of orchestrated V1 scope entirely, so
+    # it must not be mounted at all rather than being mounted and governed
+    # route-by-route — an ungoverned inference path is exactly the bypass the
+    # spec forbids. The startup parity check in orchestration/install also
+    # rejects a config that requests Kobold while the orchestrator is enabled;
+    # this guard keeps the mount honest even if only one of the two runs.
+    if config.orchestrator.enabled:
+        raise HTTPException(
+            503,
+            "kobold_unsupported: the Kobold API surface is not available in "
+            "orchestrated mode (R12/T13)",
+        )
     router.include_router(kai_router, prefix="/v1")
     router.include_router(kai_router, prefix="/latest", include_in_schema=False)
     router.include_router(extra_kai_router, prefix="/extra")

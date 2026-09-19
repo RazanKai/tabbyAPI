@@ -149,3 +149,48 @@ async def stream_model_load(
         # A repeated request for the same model returns once this load finishes.
 
         handle_request_disconnect("Model load request disconnected. The load will continue.")
+
+
+async def stream_explicit_load_progress(load_task: "asyncio.Task[None]", model_path: pathlib.Path):
+    """SSE progress for an orchestrated (coordinator-owned) explicit load.
+
+    The load runs in ``execute_explicit_load`` — the same transition authority
+    inference demand uses (R12) — and this streamer only *observes* it: a client
+    disconnect does not cancel the load, mirroring upstream's detached-task
+    discipline in ``stream_model_load`` (integration map §5: integrate, not
+    duplicate). Progress is coarse (the coordinator does not surface per-module
+    callbacks): one started event, then a finished/failed terminal event.
+    """
+    yield ModelLoadResponse(model_type="model", module=0, modules=1, status="processing").model_dump_json()
+    try:
+        await asyncio.shield(load_task)
+    except asyncio.CancelledError:
+        # The client disconnected; the coordinator still owns the load.
+        handle_request_disconnect("Model load request disconnected. The load will continue.")
+        return
+    except Exception as exc:
+        yield get_generator_error(str(exc))
+        return
+    # The load reconciled without raising: the terminal event must come from the
+    # coordinator's RECONCILED verdict — a real, envelope-verified container —
+    # never from an intention or a bare task-start (R07). `fault_reason` is read
+    # before `last_error` because a latched FAULT is the actionable diagnosis.
+    from orchestration.install import runtime
+
+    coordinator_obj = runtime.orchestrator
+    if coordinator_obj is None:
+        yield get_generator_error("Orchestrated load failed: coordinator is not installed")
+        return
+    lifecycle = getattr(coordinator_obj, "lifecycle", None)
+    status = getattr(lifecycle, "value", None)
+    if status == "READY":
+        yield ModelLoadResponse(model_type="model", module=1, modules=1, status="finished").model_dump_json()
+    else:
+        diagnosis = (
+            getattr(coordinator_obj, "fault_reason", None)
+            or getattr(coordinator_obj, "last_error", None)
+            or "load did not reach READY"
+        )
+        yield get_generator_error(
+            f"Orchestrated load failed ({status or 'unknown'}): {diagnosis}"
+        )

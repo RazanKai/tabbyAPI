@@ -122,6 +122,11 @@ class ExllamaV3Container:
     generator: Optional[AsyncGenerator] = None
     vision_model: Optional[Model] = None
 
+    # The retained handle for the fire-and-forget generator-recovery task
+    # (`_recover_from_generation_error`). Orchestrator lifecycle coordination
+    # observes this task; nothing else consumes it. Cleared per instance.
+    recovery_task: Optional[asyncio.Task] = None
+
     # Class-specific vars
     gpu_split: Optional[List[float]] = None
     gpu_split_auto: bool = True
@@ -884,6 +889,10 @@ class ExllamaV3Container:
                 await self.generator.close()
                 self.generator = None
 
+            # The container is gone; a retained recovery handle must not leak a
+            # stale reference into a future container's lifecycle decisions.
+            self.recovery_task = None
+
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -1306,7 +1315,10 @@ class ExllamaV3Container:
                 "If this fails, please restart the server.\n",
                 {"exception": str(ex)},
             )
-            asyncio.ensure_future(self.create_generator())
+            # The task handle is retained so the orchestrator (R07) can observe
+            # and adopt it: an untracked recovery cancels jobs first and mutates
+            # the generator, which must never race a coordinator teardown.
+            self.recovery_task = asyncio.ensure_future(self.create_generator())
 
             await HealthManager.add_unhealthy_event(ex)
         else:

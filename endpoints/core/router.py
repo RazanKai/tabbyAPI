@@ -51,11 +51,35 @@ from endpoints.core.utils.model import (
     get_current_model_list,
     get_dummy_models,
     get_model_list,
+    stream_explicit_load_progress,
     stream_model_load,
+    _load_tasks,
 )
+from orchestration.lifecycle import LifecycleError
+from orchestration.policy import Reason
 
 
 router = APIRouter()
+
+
+def _reject_unsupported_surface(name: str) -> None:
+    """Fail an admin mutation surface orchestrated V1 does not govern (F10/R12).
+
+    LoRA/template mutation and process-wide sampler overrides alter model state
+    (or global generation defaults) outside the coordinator's admission boundary.
+    In disabled mode these routes keep upstream behaviour byte-for-byte; in
+    enabled mode they are rejected explicitly with a stable code rather than
+    left as ungoverned paths (SPEC §2: "Reject incompatible configuration or
+    mutation instead of leaving a bypass").
+    """
+
+    if config.orchestrator.enabled:
+        raise HTTPException(
+            400,
+            f"unsupported_profile: {name} is rejected in orchestrated mode; "
+            "LoRA/template mutation and sampler overrides are outside the "
+            "calibrated single-profile scope (R12)",
+        )
 
 
 # Healthcheck endpoint
@@ -113,10 +137,24 @@ async def list_models(request: Request) -> ModelList:
 
     draft_model_dir = config.draft_model.draft_model_dir
 
-    if get_key_permission(request) == "admin":
-        models = get_model_list(model_path.resolve(), draft_model_dir)
-    else:
-        models = await get_current_model_list()
+    # F10/R12 (review minor): the non-admin branch dereferences the live
+    # container (`get_current_model_list` reads `container.model_dir` and
+    # `model_info()`), so it is a container reader and needs the same short pin
+    # as the routed readers — a soft reader that touches the container must not
+    # race a teardown and surface an ungoverned 500.
+    from orchestration.install import LeaseDenied, acquire_reader_pin, release_reader_pin
+
+    pin = None
+    try:
+        if get_key_permission(request) == "admin":
+            models = get_model_list(model_path.resolve(), draft_model_dir)
+        else:
+            pin, _ = await acquire_reader_pin(f"read:{request.state.id}")
+            models = await get_current_model_list()
+    except LeaseDenied as denied:
+        raise denied.exc from None
+    finally:
+        release_reader_pin(pin)
 
     if config.model.use_dummy_models:
         models.data[:0] = get_dummy_models()
@@ -129,34 +167,57 @@ async def list_models(request: Request) -> ModelList:
     "/v1/model",
     dependencies=[Depends(check_api_key), Depends(check_model_container)],
 )
-async def current_model() -> ModelCard:
+async def current_model(request: Request) -> ModelCard:
     """Returns the currently loaded model."""
 
-    return get_current_model()
+    # F10/R12: this read dereferences the live container, so it holds a short
+    # reader pin: it cannot cold-load (refused 503 while the model is not
+    # READY) and it never refreshes the inference TTL (R08). Disabled mode
+    # keeps upstream behaviour exactly.
+    from orchestration.install import LeaseDenied, acquire_reader_pin, release_reader_pin
+
+    pin = None
+    try:
+        pin, _ = await acquire_reader_pin(f"read:{request.state.id}")
+        return get_current_model()
+    except LeaseDenied as denied:
+        raise denied.exc from None
+    finally:
+        release_reader_pin(pin)
 
 
 @router.get("/props", dependencies=[Depends(check_api_key), Depends(check_model_container)])
-async def model_props() -> ModelPropsResponse:
+async def model_props(request: Request) -> ModelPropsResponse:
     """
     Returns specific properties of a model for clients.
 
     To get all properties, use /v1/model instead.
     """
 
-    current_model_card = get_current_model()
-    resp = ModelPropsResponse(
-        total_slots=current_model_card.parameters.max_batch_size,
-        model_path=str(model.container.model_dir),
-        default_generation_settings=ModelDefaultGenerationSettings(
-            n_ctx=current_model_card.parameters.max_seq_len,
-        ),
-        modalities=ModelPropsModalities(vision=bool(current_model_card.parameters.use_vision)),
-    )
+    # F10/R12: reader pin — same contract as /v1/model above.
+    from orchestration.install import LeaseDenied, acquire_reader_pin, release_reader_pin
 
-    if current_model_card.parameters.prompt_template_content:
-        resp.chat_template = current_model_card.parameters.prompt_template_content
+    pin = None
+    try:
+        pin, _ = await acquire_reader_pin(f"read:{request.state.id}")
+        current_model_card = get_current_model()
+        resp = ModelPropsResponse(
+            total_slots=current_model_card.parameters.max_batch_size,
+            model_path=str(model.container.model_dir),
+            default_generation_settings=ModelDefaultGenerationSettings(
+                n_ctx=current_model_card.parameters.max_seq_len,
+            ),
+            modalities=ModelPropsModalities(vision=bool(current_model_card.parameters.use_vision)),
+        )
 
-    return resp
+        if current_model_card.parameters.prompt_template_content:
+            resp.chat_template = current_model_card.parameters.prompt_template_content
+
+        return resp
+    except LeaseDenied as denied:
+        raise denied.exc from None
+    finally:
+        release_reader_pin(pin)
 
 
 @router.get("/v1/model/draft/list", dependencies=[Depends(check_api_key)])
@@ -167,15 +228,60 @@ async def list_draft_models(request: Request) -> ModelList:
     Requires an admin key to see all draft models.
     """
 
-    if get_key_permission(request) == "admin":
-        draft_model_dir = config.draft_model.draft_model_dir
-        draft_model_path = pathlib.Path(draft_model_dir)
+    # F10/R12 (review minor): the non-admin branch is a container reader
+    # (`get_current_model_list(model_type="draft")` reads the live container).
+    from orchestration.install import LeaseDenied, acquire_reader_pin, release_reader_pin
 
-        models = get_model_list(draft_model_path.resolve())
-    else:
-        models = await get_current_model_list(model_type="draft")
+    pin = None
+    try:
+        if get_key_permission(request) == "admin":
+            draft_model_dir = config.draft_model.draft_model_dir
+            draft_model_path = pathlib.Path(draft_model_dir)
+
+            models = get_model_list(draft_model_path.resolve())
+        else:
+            pin, _ = await acquire_reader_pin(f"read:{request.state.id}")
+            models = await get_current_model_list(model_type="draft")
+    except LeaseDenied as denied:
+        raise denied.exc from None
+    finally:
+        release_reader_pin(pin)
 
     return models
+
+
+def _load_overrides_rejected(data) -> Optional[str]:
+    """Name client-supplied load fields an orchestrated load must not accept.
+
+    R12/SPEC §2: the coordinator performs a narrowly preauthorized load of ONE
+    calibrated profile. The orchestrated branch builds its load kwargs from
+    ``config.orchestrator.model`` only, so any other client-supplied field that
+    would change the effective load (a draft model, an ad-hoc context/cache
+    size, a prompt template, vision) would be *silently ignored* — accepted but
+    ungoverned. Refusing explicitly is what R12 asks for.
+
+    ``None`` means the request carries no such override.
+    """
+
+    if data.draft_model is not None:
+        return (
+            "draft_model is rejected in orchestrated mode; drafting is outside "
+            "V1's calibrated envelope (SPEC §2)"
+        )
+    for field in ("max_seq_len", "cache_size", "cache_mode", "chunk_size", "max_batch_size"):
+        if getattr(data, field, None) is not None:
+            return (
+                f"{field} is rejected in orchestrated mode; the calibrated "
+                f"profile in orchestrator.model is the only load envelope (R14)"
+            )
+    for field in ("prompt_template", "vision", "gpu_split", "rope_scale", "rope_alpha"):
+        value = getattr(data, field, None)
+        if value not in (None, [], False):
+            return (
+                f"{field} is rejected in orchestrated mode; it is not part of the "
+                f"calibrated profile (R12/SPEC §2)"
+            )
+    return None
 
 
 # Load model endpoint
@@ -203,6 +309,60 @@ async def load_model(data: ModelLoadRequest) -> ModelLoadResponse:
 
         raise HTTPException(400, error_message)
 
+    # Enabled mode: explicit loads use the SAME admission/transition machinery as
+    # inference demand (R12) — the coordinator is the only load authority. The
+    # configured model may be loaded through admission (quiet window + capacity +
+    # transition token); anything else is refused, and skip_queue is rejected
+    # because it could interrupt active work.
+    if config.orchestrator.enabled:
+        from orchestration.install import runtime
+
+        configured = config.orchestrator.model.name
+        if data.model_name != configured:
+            raise HTTPException(
+                404,
+                f"model_not_configured: {data.model_name!r} is not the configured "
+                f"model ({configured!r})",
+            )
+        if data.skip_queue:
+            raise HTTPException(
+                400,
+                "unsupported_profile: skip_queue is rejected in orchestrated mode; "
+                "explicit loads use the same admission machinery as inference (R12)",
+            )
+        # R12/SPEC §2: the orchestrated load uses the CALIBRATED profile only, so
+        # any client-supplied field that would alter the effective load must be
+        # REFUSED rather than silently ignored. Silently dropping them left a
+        # load-altering request accepted-but-ungoverned (review major); a draft
+        # model in particular is outside V1's calibrated envelope entirely.
+        rejected = _load_overrides_rejected(data)
+        if rejected is not None:
+            raise HTTPException(400, f"unsupported_profile: {rejected}")
+        coordinator_obj = runtime.orchestrator
+        if coordinator_obj is None:
+            raise HTTPException(503, "orchestrator_fault: coordinator is not installed")
+        try:
+            # Reserve the transition (this is the admission boundary for explicit
+            # demand). Raises LifecycleError if another transition is active.
+            coordinator_obj.reserve_explicit_load()
+        except LifecycleError as exc:
+            raise HTTPException(503, f"model_transition: {exc}") from exc
+        except Exception as exc:
+            raise HTTPException(503, f"gpu_not_quiet: {exc}") from exc
+
+        # The load is executed by the coordinator's production deps (same
+        # calibrated-envelope kwargs as inference demand) and observed to
+        # completion, exactly like the detached admin load upstream keeps in
+        # _load_tasks — integrate, not duplicate.
+        load_task = asyncio.create_task(coordinator_obj.execute_explicit_load())
+        _load_tasks.add(load_task)
+        load_task.add_done_callback(_load_tasks.discard)
+
+        return EventSourceResponse(
+            stream_explicit_load_progress(load_task, model_path),
+            ping=get_sse_ping_interval(),
+        )
+
     return EventSourceResponse(stream_model_load(data, model_path), ping=get_sse_ping_interval())
 
 
@@ -213,6 +373,19 @@ async def load_model(data: ModelLoadRequest) -> ModelLoadResponse:
 )
 async def unload_model():
     """Unloads the currently loaded model."""
+
+    # Enabled mode: an explicit unload initiates a safe DRAIN, not a forced
+    # interruption — upstream's hard-coded skip_wait=True cancels active jobs,
+    # which R08 forbids under orchestration (integration map §5). The drain
+    # reason is EXPLICIT_UNLOAD so a later resume() cannot cancel it.
+    if config.orchestrator.enabled:
+        from orchestration.install import runtime
+
+        coordinator_obj = runtime.orchestrator
+        if coordinator_obj is not None:
+            await coordinator_obj.request_unload(Reason.EXPLICIT_UNLOAD)
+            return
+
     await model.unload_model(skip_wait=True)
 
 
@@ -251,7 +424,18 @@ async def list_all_loras(request: Request) -> LoraList:
         lora_path = pathlib.Path(config.lora.lora_dir)
         loras = get_lora_list(lora_path.resolve())
     else:
-        loras = get_active_loras()
+        # F10/R12 (review minor): `get_active_loras()` reads the live container's
+        # LoRA state, so it is a container reader and takes the same short pin.
+        from orchestration.install import LeaseDenied, acquire_reader_pin, release_reader_pin
+
+        pin = None
+        try:
+            pin, _ = await acquire_reader_pin(f"read:{request.state.id}")
+            loras = get_active_loras()
+        except LeaseDenied as denied:
+            raise denied.exc from None
+        finally:
+            release_reader_pin(pin)
 
     return loras
 
@@ -274,6 +458,8 @@ async def active_loras() -> LoraList:
 )
 async def load_lora(data: LoraLoadRequest) -> LoraLoadResponse:
     """Loads a LoRA into the model container."""
+
+    _reject_unsupported_surface("POST /v1/lora/load")
 
     if not data.loras:
         error_message = handle_request_error(
@@ -307,6 +493,8 @@ async def load_lora(data: LoraLoadRequest) -> LoraLoadResponse:
 )
 async def unload_loras():
     """Unloads the currently loaded loras."""
+
+    _reject_unsupported_surface("POST /v1/lora/unload")
 
     await model.unload_loras()
 
@@ -345,6 +533,8 @@ async def get_embedding_model() -> ModelCard:
 async def load_embedding_model(
     request: Request, data: EmbeddingModelLoadRequest
 ) -> ModelLoadResponse:
+    _reject_unsupported_surface("POST /v1/model/embedding/load")
+
     # Verify request parameters
     if not data.embedding_model_name:
         error_message = handle_request_error(
@@ -400,8 +590,28 @@ async def unload_embedding_model():
     "/v1/token/encode",
     dependencies=[Depends(check_api_key), Depends(check_model_container)],
 )
-async def encode_tokens(data: TokenEncodeRequest) -> TokenEncodeResponse:
+async def encode_tokens(request: Request, data: TokenEncodeRequest) -> TokenEncodeResponse:
     """Encodes a string or chat completion messages into tokens."""
+
+    # F10/R12: reader pin — a tokenization read dereferences the live
+    # container/tokenizer, so it holds a short pin (no cold-load, no TTL
+    # refresh). Disabled mode keeps upstream behaviour exactly.
+    from orchestration.install import LeaseDenied, acquire_reader_pin, release_reader_pin
+
+    pin = None
+    try:
+        pin, _ = await acquire_reader_pin(f"read:{request.state.id}")
+    except LeaseDenied as denied:
+        raise denied.exc from None
+
+    try:
+        return await _encode_tokens_impl(request, data)
+    finally:
+        release_reader_pin(pin)
+
+
+async def _encode_tokens_impl(request: Request, data: TokenEncodeRequest) -> TokenEncodeResponse:
+    """The upstream encode_tokens body, unchanged (disabled-mode parity)."""
 
     mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None
 
@@ -458,13 +668,22 @@ async def encode_tokens(data: TokenEncodeRequest) -> TokenEncodeResponse:
     "/v1/token/decode",
     dependencies=[Depends(check_api_key), Depends(check_model_container)],
 )
-async def decode_tokens(data: TokenDecodeRequest) -> TokenDecodeResponse:
+async def decode_tokens(request: Request, data: TokenDecodeRequest) -> TokenDecodeResponse:
     """Decodes tokens into a string."""
 
-    message = model.container.decode_tokens(data.tokens, **data.get_params())
-    response = TokenDecodeResponse(text=unwrap(message, ""))
+    # F10/R12: reader pin — see encode_tokens above.
+    from orchestration.install import LeaseDenied, acquire_reader_pin, release_reader_pin
 
-    return response
+    pin = None
+    try:
+        pin, _ = await acquire_reader_pin(f"read:{request.state.id}")
+        message = model.container.decode_tokens(data.tokens, **data.get_params())
+        response = TokenDecodeResponse(text=unwrap(message, ""))
+        return response
+    except LeaseDenied as denied:
+        raise denied.exc from None
+    finally:
+        release_reader_pin(pin)
 
 
 @router.get("/v1/auth/permission", dependencies=[Depends(check_api_key)])
@@ -514,6 +733,8 @@ async def list_templates(request: Request) -> TemplateList:
 async def switch_template(data: TemplateSwitchRequest):
     """Switch the currently loaded template."""
 
+    _reject_unsupported_surface("POST /v1/template/switch")
+
     if not data.prompt_template_name:
         error_message = handle_request_error(
             "New template name not found.",
@@ -541,6 +762,8 @@ async def switch_template(data: TemplateSwitchRequest):
 )
 async def unload_template():
     """Unloads the currently selected template"""
+
+    _reject_unsupported_surface("POST /v1/template/unload")
 
     model.container.prompt_template = None
 
@@ -570,6 +793,8 @@ async def list_sampler_overrides(request: Request) -> SamplerOverrideListRespons
 async def switch_sampler_override(data: SamplerOverrideSwitchRequest):
     """Switch the currently loaded override preset"""
 
+    _reject_unsupported_surface("POST /v1/sampling/override/switch")
+
     if data.preset:
         try:
             await sampling.overrides_from_file(data.preset)
@@ -598,5 +823,7 @@ async def switch_sampler_override(data: SamplerOverrideSwitchRequest):
 )
 async def unload_sampler_override():
     """Unloads the currently selected override preset"""
+
+    _reject_unsupported_surface("POST /v1/sampling/override/unload")
 
     sampling.overrides_from_dict({})

@@ -816,9 +816,16 @@ async def stream_generate_chat_completion(
     request: Request,
     model_path: pathlib.Path,
     disconnect_handler: DisconnectHandler,
+    *,
+    lease_ctx=None,
 ):
     """
     Generator for the generation process.
+
+    ``lease_ctx`` is the orchestrator's lease context (enabled mode only, see
+    orchestration/install.py). Released from the ``finally`` below via the
+    backend observer: streaming never awaits ``gen_tasks`` here, so the lease
+    must outlive this generator until the tasks really finish (map §2).
     """
 
     gen_queue = asyncio.Queue()
@@ -918,6 +925,12 @@ async def stream_generate_chat_completion(
 
     finally:
         await disconnect_handler.cleanup()
+        # Orchestrated lease release (enabled mode only) — see completion.py's
+        # stream wrapper. Idempotent, never raises.
+        if lease_ctx is not None:
+            from orchestration.install import release_lease_in_finally
+
+            release_lease_in_finally(lease_ctx, gen_tasks)
 
 
 async def generate_chat_completion(
@@ -927,6 +940,8 @@ async def generate_chat_completion(
     request: Request,
     model_path: pathlib.Path,
     disconnect_handler: DisconnectHandler,
+    *,
+    lease_ctx=None,
 ):
     gen_tasks: List[asyncio.Task] = []
     return_usage = data.stream_options and data.stream_options.include_usage
@@ -997,3 +1012,8 @@ async def generate_chat_completion(
 
     finally:
         await disconnect_handler.cleanup()
+        # Non-streaming awaited gen_tasks above — release now (see completion.py).
+        if lease_ctx is not None:
+            from orchestration.install import release_lease_in_finally
+
+            release_lease_in_finally(lease_ctx, gen_tasks)

@@ -68,6 +68,20 @@ def setup_app(host: Optional[str] = None, port: Optional[int] = None):
             f"(docs at http://{host}:{port}/redoc)"
         )
 
+    # Orchestrator control routes (R12): mounted ONLY in enabled mode, so a
+    # disabled server exposes no orchestration surface at all.
+    if config.orchestrator.enabled:
+        from orchestration import install
+        from orchestration.api import setup as orchestrator_setup
+
+        if install.runtime.orchestrator is None:
+            raise RuntimeError(
+                "orchestrator.enabled is true but the coordinator is not installed; "
+                "startup order is broken (main.entrypoint_async must call install.enable)"
+            )
+        app.include_router(orchestrator_setup())
+        logger.info("Orchestrator control routes mounted (/v1/orchestrator/*)")
+
     # Include core API request paths
     app.include_router(CoreRouter)
 

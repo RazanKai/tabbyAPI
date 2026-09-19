@@ -253,9 +253,19 @@ async def stream_generate_completion(
     request: Request,
     model_path: pathlib.Path,
     disconnect_handler: DisconnectHandler,
+    *,
+    lease_ctx=None,
 ):
     """
     Generator for the generation process.
+
+    ``lease_ctx`` is the orchestrator's lease context (enabled mode only, see
+    orchestration/install.py). In the ``finally`` below it is handed to a
+    backend observer that releases the lease only after ``gen_tasks`` have
+    really finished: for streaming, returning the response object is not
+    completion, and a client disconnect is not proof backend work stopped
+    (integration map §2). With no tasks outstanding (early raise before any
+    collector was created) the lease is released immediately.
     """
 
     if isinstance(prompts, str):
@@ -359,6 +369,13 @@ async def stream_generate_completion(
 
     finally:
         await disconnect_handler.cleanup()
+        # Orchestrated lease release (enabled mode only). Streaming never
+        # awaits gen_tasks here, so release is deferred to a backend observer
+        # that waits for the tasks; with none, release directly. Idempotent.
+        if lease_ctx is not None:
+            from orchestration.install import release_lease_in_finally
+
+            release_lease_in_finally(lease_ctx, gen_tasks)
 
 
 async def generate_completion(
@@ -367,6 +384,8 @@ async def generate_completion(
     request: Request,
     model_path: pathlib.Path,
     disconnect_handler: DisconnectHandler,
+    *,
+    lease_ctx=None,
 ):
     """Non-streaming generate for completions"""
 
@@ -442,3 +461,10 @@ async def generate_completion(
 
     finally:
         await disconnect_handler.cleanup()
+        # Non-streaming awaited gen_tasks above, so they are done by now — the
+        # observer form still applies (empty list → immediate release), which
+        # keeps both wrappers on one release discipline. Idempotent, never raises.
+        if lease_ctx is not None:
+            from orchestration.install import release_lease_in_finally
+
+            release_lease_in_finally(lease_ctx, gen_tasks)
