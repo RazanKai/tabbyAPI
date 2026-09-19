@@ -281,9 +281,55 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejection_body_is_the_structured_r12_shape(self):
         """R12: the rejection body is {"error": {...code...}}, not {"detail": ...}.
 
-        This exercises the app-level handler the production server installs, so
-        what is asserted is the body an inference client actually receives.
+        Deliberately builds the app through the PRODUCTION ``setup_app()`` and
+        drives a route that performs a real orchestration rejection. An earlier
+        version of this test registered the handler itself, which proved only that
+        the handler works — deleting the wiring in ``endpoints/server.py`` left it
+        green (mutation-measured). This version fails if that wiring is removed.
+
+        The config section must be registered and re-loaded first: the module-level
+        ``config`` singleton was built before registration, so the attribute does
+        not exist until ``load()`` revalidates (the same ordering the production
+        server and ``UnsupportedSurfaceTests`` rely on).
         """
+        from orchestration import install as install_module
+
+        install_module.install_config_section()
+        from common.tabby_config import config as tabby_config
+
+        tabby_config.load()
+        with unittest.mock.patch.object(tabby_config.orchestrator, "enabled", True):
+            await self._assert_structured_rejection()
+
+    async def _assert_structured_rejection(self):
+        from endpoints.server import setup_app
+
+        app = setup_app()
+
+        from common.auth import check_admin_key, check_api_key
+        from common.model import check_embeddings_container, check_model_container
+
+        app.dependency_overrides[check_admin_key] = lambda: "t"
+        app.dependency_overrides[check_api_key] = lambda: "t"
+
+        async def _pass():
+            return None
+
+        app.dependency_overrides[check_model_container] = _pass
+        app.dependency_overrides[check_embeddings_container] = _pass
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/v1/lora/unload", json={})
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertIn("error", body, "the structured body must come from the production wiring")
+        self.assertEqual(body["error"]["code"], "unsupported_profile")
+        self.assertEqual(body["error"]["type"], "orchestrator_error")
+        self.assertIn("param", body["error"])
+
+    async def test_orchestration_exception_handler_renders_the_documented_body(self):
+        """The handler itself, exercised directly (unit-level companion)."""
         from fastapi import FastAPI
 
         from orchestration.errors import (
@@ -304,9 +350,8 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
         response = await self._get(app, "GET", "/boom")
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.headers.get("retry-after"), "5")
-        body = response.json()
         self.assertEqual(
-            body["error"],
+            response.json()["error"],
             {
                 "message": "external_gpu_busy: an external workload holds the device",
                 "type": "orchestrator_error",
@@ -383,6 +428,23 @@ class UnsupportedSurfaceTests(unittest.TestCase):
                 return await client.post(path, json=json_body or {})
 
         return asyncio.run(call())
+
+    def assert_rejected_with_code(self, response, expected_code="unsupported_profile",
+                                  *, expect_structured=False):
+        """Assert the rejection, and (when the production handler is wired) its shape.
+
+        The bare-``detail`` assertion alone was satisfied by a rejection whether or
+        not any exception handler existed, so it proved nothing about the R12 body.
+        ``expect_structured`` is passed by the tests that go through the real app.
+        """
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        if expect_structured:
+            self.assertIn("error", body)
+            self.assertEqual(body["error"]["code"], expected_code)
+        else:
+            self.assertIn(expected_code, body["detail"])
 
     def test_lora_load_is_rejected(self):
         response = self._post("/v1/lora/load", {"loras": [{"name": "x"}]})

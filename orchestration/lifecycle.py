@@ -778,6 +778,22 @@ class LifecycleCoordinator:
                 grant: Optional[str] = None
                 deny_reason: Optional[Reason] = None
                 result_verdict: dict = {}
+
+                # A verdict already written for this waiter by an OUT-OF-BAND
+                # releaser (pause/shutdown fail unadmitted waiters and set
+                # `waiter.result` before releasing the slot) must be DELIVERED,
+                # not recomputed. Without this the waiter is stranded: pause
+                # removes it from `self._waiters`, so the deny conditions below
+                # (which read the queue) can never fire again, and if the pause is
+                # cleared in the same event-loop tick the waiter grinds on to its
+                # own deadline and reports `admission_timeout` — the wrong code,
+                # after the full `max_wait_seconds` (measured: 2186.6 s of
+                # injected clock, versus 0.4 s when the pause verdict is
+                # delivered). The grant path never sets `result`, so this cannot
+                # pre-empt a normal admission.
+                if waiter.released and waiter.result is not None and not waiter.admitted:
+                    return waiter.result
+
                 async with self._mutex:
                     now = self._clock()
                     if waiter.expired_at(now):
@@ -1013,7 +1029,25 @@ class LifecycleCoordinator:
         with contextlib.suppress(Exception):
             present = bool(self.deps.container_present())
 
+        # Any load task from a previous process is gone with that process; the
+        # recovery task is cleared first so adoption below is the sole owner of it.
+        self._load_task = None
+        self._recovery_task = None
         adopted = self.adopt_recovery_task()
+
+        # R13: the transition token is part of "no trusted residency" and must be
+        # reconciled too. A reserved-but-unexecuted token (``pause()`` reserves the
+        # unload and hands execution to ``tick()``) would otherwise survive the
+        # reconciliation with its only executor disarmed by the flag clears below:
+        # `tick()` branch -1 can no longer fire, branch 1 needs READY, branch 2
+        # needs DRAINING, and `reserve_explicit_load` refuses while a token is
+        # held — a state with no teardown path and no recovery short of a process
+        # restart. No transition can legitimately be in flight across a restart:
+        # any task that was driving one died with the previous process.
+        prior_transition = self._transition_kind if self._transition_active else None
+        self._transition_active = False
+        self._transition_kind = None
+        self._transition_started = None
 
         self._leases.clear()
         self._waiters.clear()
@@ -1041,6 +1075,7 @@ class LifecycleCoordinator:
             "recovery_adopted": adopted,
             "leases": 0,
             "pending": 0,
+            "discarded_transition": prior_transition,
         }
 
     async def _execute_load(self) -> tuple[bool, Optional[str]]:
@@ -1726,8 +1761,13 @@ def _first_reason(blockers: list[str]) -> Reason:
     if head.startswith("external_workload"):
         return Reason.EXTERNAL_GPU_BUSY
     if head.startswith("model_recovery"):
-        # A generator recovery is a backend transition: the same "retry after
-        # the mutation settles" family as model_transition (R07/F12).
+        # DECISION (recorded, not incidental): a generator recovery publishes the
+        # diagnostic blocker `model_recovery:generator` but reports the code
+        # `model_transition`. Rationale: R12's table is the set of codes a client
+        # may act on, and adding `model_recovery` would emit a code the contract
+        # does not enumerate. The retry semantics are identical either way ("retry
+        # after the backend mutation settles"), so an inference-only client is not
+        # misled; the blocker string carries the precise cause for an operator.
         return Reason.MODEL_TRANSITION
     if head.startswith("quiet_window"):
         return Reason.GPU_NOT_QUIET

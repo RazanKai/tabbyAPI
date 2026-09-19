@@ -43,11 +43,6 @@ router = APIRouter()
 #: "pre-admission unavailable" bucket rather than leaking a wrong status.
 _RETRY_AFTER_SECONDS = RETRY_AFTER_SECONDS
 
-_ADMISSION_TIMEOUT = "admission_timeout"
-_QUEUE_FULL = "admission_queue_full"
-_UNSUPPORTED_PROFILE = "unsupported_profile"
-_MODEL_NOT_CONFIGURED = "model_not_configured"
-
 
 def status_for(reason: Reason) -> int:
     """Map a reason code to the HTTP status the spec's table assigns it."""

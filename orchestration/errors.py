@@ -25,21 +25,6 @@ from fastapi.responses import JSONResponse
 #: guarantee and not a command to retry indefinitely (R12).
 RETRY_AFTER_SECONDS = 5
 
-#: Stable reason codes (SPEC R12 table). Kept as constants so a typo in a raise site
-#: is a NameError at import, not a silently-unmapped code at request time.
-UNSUPPORTED_PROFILE = "unsupported_profile"
-MODEL_NOT_CONFIGURED = "model_not_configured"
-ADMISSION_QUEUE_FULL = "admission_queue_full"
-EXTERNAL_GPU_BUSY = "external_gpu_busy"
-GPU_NOT_QUIET = "gpu_not_quiet"
-INSUFFICIENT_VRAM = "insufficient_vram"
-TELEMETRY_UNAVAILABLE = "telemetry_unavailable"
-ORCHESTRATOR_PAUSED = "orchestrator_paused"
-ORCHESTRATOR_FAULT = "orchestrator_fault"
-MODEL_TRANSITION = "model_transition"
-REQUEST_CAPACITY = "request_capacity"
-ADMISSION_TIMEOUT = "admission_timeout"
-
 
 def error_content(code: str, message: str, *, retryable: bool = False) -> dict:
     """Build the stable orchestration error body.

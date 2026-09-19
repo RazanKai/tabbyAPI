@@ -84,6 +84,43 @@ def _reject_unsupported_surface(name: str) -> None:
         )
 
 
+def _lifecycle_reason_code(message: str) -> str:
+    """Extract the stable reason code a ``LifecycleError`` message carries.
+
+    ``reserve_explicit_load`` raises with the code as the whole message when it
+    comes from the blocker list (`_first_reason(blockers).value`), or as
+    ``transition already active: <kind>`` when a transition is in flight. Both
+    shapes are mapped here so the admin load reports the same code family an
+    inference client would see for the same condition, instead of collapsing
+    everything to `model_transition` (R12).
+    """
+
+    text = (message or "").strip()
+    if text.startswith("transition already active"):
+        return Reason.MODEL_TRANSITION.value
+    # The blocker form is exactly a Reason value; anything unrecognised degrades to
+    # the generic transition code rather than inventing a new one.
+    for reason in Reason:
+        if text == reason.value:
+            return reason.value
+    return Reason.MODEL_TRANSITION.value
+
+
+def _reason_is_temporary(code: str) -> bool:
+    """Whether a modest Retry-After belongs on this refusal.
+
+    Mirrors ``orchestration.api.is_temporary`` for the codes the admin load can
+    emit: pause and fault are not "retry in 5s and it will work" conditions.
+    """
+
+    from orchestration.api import is_temporary
+
+    for reason in Reason:
+        if reason.value == code:
+            return is_temporary(reason)
+    return False
+
+
 # Healthcheck endpoint
 @router.get("/health")
 async def healthcheck(response: Response) -> HealthCheckResponse:
@@ -350,11 +387,17 @@ async def load_model(data: ModelLoadRequest) -> ModelLoadResponse:
             )
         try:
             # Reserve the transition (this is the admission boundary for explicit
-            # demand). Raises LifecycleError if another transition is active.
+            # demand). Raises LifecycleError carrying the REAL reason code in its
+            # message (`orchestrator_paused`, `external_gpu_busy`, `gpu_not_quiet`,
+            # `insufficient_vram`, …), which must be reported as-is: R12's table
+            # exists so a client can tell "paused" from "retrying is reasonable",
+            # and collapsing every refusal to `model_transition` destroys exactly
+            # that distinction.
             coordinator_obj.reserve_explicit_load()
         except LifecycleError as exc:
+            reason = _lifecycle_reason_code(str(exc))
             raise orchestration_error(
-                503, Reason.MODEL_TRANSITION.value, str(exc), retryable=True
+                503, reason, str(exc), retryable=_reason_is_temporary(reason)
             ) from exc
         except Exception as exc:
             raise orchestration_error(

@@ -1847,3 +1847,132 @@ def test_restart_adopts_a_recovery_already_running(calibrated_config):
                 await deps.recovery_task
 
     asyncio.run(go())
+
+
+def test_review_reconcile_discards_a_reserved_transition_token(calibrated_config):
+    """BLOCKER (M4 review): reconciliation must not strand a reserved token.
+
+    ``pause()`` with nothing outstanding reserves the unload transition and hands
+    execution to ``tick()`` (branch -1). Reconciling only the FLAGS left that token
+    set with its only executor disarmed — `tick()` could never unload (branch -1
+    needs the flag, branch 1 needs READY, branch 2 needs DRAINING),
+    ``reserve_explicit_load`` refused forever, and the state was unrecoverable
+    without a process restart. Reproduced before the fix: lifecycle FAULT with the
+    container still present and three `tick()` calls returning None.
+    """
+    coord, deps, clock = build(calibrated_config)
+    elapse_quiet(coord, clock)
+
+    async def go():
+        admission = await coord.acquire_lease("warm")
+        assert admission.outcome is AdmissionOutcome.GRANTED, admission.reason
+        await coord.release_lease(admission.lease)
+        await coord.pause()  # reserves the unload, defers to tick()
+        assert coord._transition_active is True
+        assert coord._pending_unload is True
+
+        deps._present = True  # a container exists at "restart"
+        result = coord.reconcile_startup_sync()
+
+        assert result["discarded_transition"] == "unload"
+        assert coord._transition_active is False, (
+            "a reserved token must not survive reconciliation"
+        )
+        assert coord._transition_kind is None
+
+        # The state must be RECOVERABLE. Before the fix, the surviving token made
+        # `reserve_explicit_load` raise `transition already active` forever — the
+        # unrecoverable wedge. Now the container is gone, a second reconciliation
+        # clears the stray-container FAULT, and a reservation succeeds.
+        deps._present = False
+        coord.reconcile_startup_sync()
+        await coord.resume()
+        elapse_quiet(coord, clock)
+        coord.reserve_explicit_load()
+        assert coord._transition_active is True
+        coord._release_transition_locked()
+
+    asyncio.run(go())
+
+
+def test_review_reconcile_clears_a_token_so_maintenance_can_act(calibrated_config):
+    """The same blocker, asserted through the recovery path rather than the token."""
+    coord, deps, clock = build(calibrated_config)
+    elapse_quiet(coord, clock)
+
+    async def go():
+        admission = await coord.acquire_lease("warm")
+        assert admission.outcome is AdmissionOutcome.GRANTED, admission.reason
+        await coord.release_lease(admission.lease)
+        await coord.pause()
+        deps._present = True
+        coord.reconcile_startup_sync()
+
+        # With the token gone and no container, `tick()` must be able to progress
+        # rather than returning None forever.
+        deps._present = False
+        result = coord.reconcile_startup_sync()
+        assert result["lifecycle"] == "UNLOADED"
+        assert coord._transition_active is False
+        actions = [await coord.tick() for _ in range(3)]
+        assert all(a is None for a in actions), (
+            "an UNLOADED, token-free coordinator has nothing to do — and must not wedge"
+        )
+
+    asyncio.run(go())
+
+
+def test_review_pause_then_resume_waiter_gets_the_pause_verdict(calibrated_config):
+    """MAJOR (M4 review): a pause-released waiter must deliver the pause verdict.
+
+    ``pause()`` fails unadmitted waiters by writing ``waiter.result`` and releasing
+    the slot. The waiter loop read only the queue, which pause had just emptied, so
+    if the pause was cleared in the same event-loop tick the waiter ground on to its
+    own deadline and reported ``admission_timeout`` — the wrong code, after the full
+    ``max_wait_seconds`` (measured before the fix: 2186.6 s of injected clock
+    versus 0.4 s when the verdict is delivered).
+    """
+    coord, deps, clock = build(wait_config(calibrated_config, wait_seconds=60.0))
+    elapse_quiet(coord, clock)
+
+    async def go():
+        holder = await coord.acquire_lease("holder")
+        waiter_task = asyncio.create_task(coord.acquire_lease("queued"))
+        for _ in range(4):
+            await asyncio.sleep(0)
+        assert len(coord._waiters) == 1, "the request is queued"
+
+        await coord.pause()
+        assert len(coord._waiters) == 0, "pause releases the waiter's slot"
+        await coord.resume()  # clear the pause in the SAME tick
+
+        result = await asyncio.wait_for(waiter_task, timeout=5)
+        assert result.outcome is AdmissionOutcome.DENIED
+        assert result.reason is Reason.ORCHESTRATOR_PAUSED, (
+            f"must report the pause, not a deadline expiry (got {result.reason})"
+        )
+        await coord.release_lease(holder.lease)
+
+    asyncio.run(go())
+
+
+def test_review_waiter_grant_path_still_wins_over_a_stale_verdict(calibrated_config):
+    """Guard for the fix: a NORMAL admission sets no `result`, so it is unaffected."""
+    coord, deps, clock = build(wait_config(calibrated_config, wait_seconds=60.0))
+    elapse_quiet(coord, clock)
+
+    async def go():
+        holder = await coord.acquire_lease("holder")
+        waiter_task = asyncio.create_task(coord.acquire_lease("queued"))
+        for _ in range(4):
+            await asyncio.sleep(0)
+        assert len(coord._waiters) == 1
+        await coord.release_lease(holder.lease)  # frees the slot; waiter should be GRANTED
+        result = await asyncio.wait_for(waiter_task, timeout=5)
+        assert result.outcome is AdmissionOutcome.GRANTED, (
+            "a released slot must still admit the queued head"
+        )
+        assert result.lease is not None
+        await coord.release_lease(result.lease)
+
+    asyncio.run(go())
