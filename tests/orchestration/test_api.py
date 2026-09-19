@@ -24,6 +24,7 @@ from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from orchestration import api as orch_api
+from orchestration import errors as orch_errors
 from orchestration import install as install_module
 from orchestration.lifecycle import AdmissionOutcome, AdmissionResult, LifecycleCoordinator
 from orchestration.policy import Reason
@@ -185,6 +186,21 @@ class StatusMappingTests(unittest.TestCase):
             },
         )
 
+    def test_admission_http_exception_is_the_structured_body(self):
+        # R12: the rejection must carry the stable code as a machine-readable
+        # field, not only inside prose — an inference-only client has no other
+        # channel to learn why it was refused.
+        result = AdmissionResult(
+            outcome=AdmissionOutcome.DENIED,
+            reason=Reason.EXTERNAL_GPU_BUSY,
+            detail={"message": "an external workload holds the device"},
+        )
+        exc = orch_api.admission_http_exception(result)
+        self.assertIsInstance(exc, orch_errors.OrchestrationHTTPException)
+        self.assertEqual(exc.code, "external_gpu_busy")
+        self.assertTrue(exc.retryable)
+        self.assertEqual(exc.headers, {"Retry-After": "5"})
+
 
 class RouteTests(unittest.IsolatedAsyncioTestCase):
     """The three R12 routes over a real coordinator."""
@@ -261,6 +277,44 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
         response = await self._get(app, "GET", "/v1/orchestrator/status")
         self.assertEqual(response.status_code, 503)
         self.assertIn("orchestrator_fault", response.json()["detail"])
+
+    async def test_rejection_body_is_the_structured_r12_shape(self):
+        """R12: the rejection body is {"error": {...code...}}, not {"detail": ...}.
+
+        This exercises the app-level handler the production server installs, so
+        what is asserted is the body an inference client actually receives.
+        """
+        from fastapi import FastAPI
+
+        from orchestration.errors import (
+            OrchestrationHTTPException,
+            orchestration_exception_handler,
+        )
+
+        app = FastAPI()
+        app.add_exception_handler(OrchestrationHTTPException, orchestration_exception_handler)
+
+        @app.get("/boom")
+        async def boom():
+            raise orch_errors.orchestration_error(
+                503, "external_gpu_busy", "an external workload holds the device",
+                retryable=True,
+            )
+
+        response = await self._get(app, "GET", "/boom")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.headers.get("retry-after"), "5")
+        body = response.json()
+        self.assertEqual(
+            body["error"],
+            {
+                "message": "external_gpu_busy: an external workload holds the device",
+                "type": "orchestrator_error",
+                "param": None,
+                "code": "external_gpu_busy",
+                "retry_after_seconds": 5,
+            },
+        )
 
 
 class UnsupportedSurfaceTests(unittest.TestCase):

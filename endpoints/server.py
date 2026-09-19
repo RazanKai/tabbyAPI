@@ -13,6 +13,10 @@ from common.tabby_config import config
 from endpoints.Kobold import router as KoboldRouter
 from endpoints.OAI import router as OAIRouter
 from endpoints.core.router import router as CoreRouter
+from orchestration.errors import (
+    OrchestrationHTTPException,
+    orchestration_exception_handler,
+)
 
 
 def setup_app(host: Optional[str] = None, port: Optional[int] = None):
@@ -28,6 +32,12 @@ def setup_app(host: Optional[str] = None, port: Optional[int] = None):
         dependencies=get_global_depends(),
     )
     app.add_exception_handler(ContextLengthHTTPException, context_length_exception_handler)
+    # R12: orchestration rejections use the same structured error-body convention as
+    # upstream's context-length error ({"error": {message, type, param, code}}) rather
+    # than a bare {"detail": ...}. Registered unconditionally — it renders a subclass of
+    # HTTPException and is inert unless an orchestration rejection is raised, so
+    # disabled mode is unaffected (R01).
+    app.add_exception_handler(OrchestrationHTTPException, orchestration_exception_handler)
 
     # Allow CORS requests from the configured origins.
     # allow_credentials stays False: TabbyAPI authenticates with a header/query

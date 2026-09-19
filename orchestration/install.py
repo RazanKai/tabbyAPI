@@ -447,6 +447,17 @@ def enable() -> None:
     runtime.orchestrator = coordinator_obj
     runtime.telemetry = telemetry
     runtime.sampler = TelemetrySampler(coordinator_obj, telemetry, orch_cfg.telemetry.sample_seconds)
+
+    # R13: restart starts with no trusted residency. Reconcile believed state
+    # against the real container BEFORE the sampler or any request can act on
+    # it — a container left over from a previous process (or an upstream startup
+    # load) must be surfaced, not silently adopted as calibrated residency.
+    # This runs synchronously and without the mutex on purpose: enable() is
+    # called before the event loop serves anything, so nothing else can be
+    # touching the coordinator yet (no asyncio.run here — enable() may itself be
+    # called from inside a running loop).
+    _log(f"startup reconciliation: {coordinator_obj.reconcile_startup_sync()}")
+
     runtime.sampler.start()
     runtime.sampler.wake()
 

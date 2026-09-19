@@ -972,6 +972,77 @@ class LifecycleCoordinator:
         if self._waiters:
             self._wake_waiters()
 
+    # ------------------------------------------------------------------ #
+    # Restart reconciliation (R13)
+    # ------------------------------------------------------------------ #
+
+    async def reconcile_startup(self) -> dict:
+        """Bring believed state in line with reality at process start (R13).
+
+        R13: "Restart starts with no trusted residency, no leases, and no pending
+        requests. Read the actual container, not persisted lifecycle belief."
+
+        Everything here is therefore *observed*, never assumed:
+
+        * the coordinator is constructed UNLOADED with an empty lease table and no
+          waiters, so a restart can never inherit a lease from a previous process;
+        * residency is read back from the live container. A container that exists
+          without any coordinator-owned load is a **bypass** (an upstream startup
+          load, a leftover dummy model, an embedding container) — it is reported
+          and latched as a fault condition rather than silently adopted, because
+          admitting against an unmeasured residency is exactly what R01/R05 forbid;
+        * a generator recovery that is still running from before is adopted so its
+          teardown-race protection applies immediately.
+
+        No model is loaded and no lease is granted by this call.
+        """
+
+        async with self._mutex:
+            return self.reconcile_startup_sync()
+
+    def reconcile_startup_sync(self) -> dict:
+        """The reconciliation itself, without taking the mutex.
+
+        Used by ``enable()`` before the sampler starts and before any request can
+        reach the coordinator: at that moment this process is the only thing that
+        can touch it, so the mutex would be a no-op. Every *other* caller goes
+        through :meth:`reconcile_startup`, which does hold it.
+        """
+
+        present = False
+        with contextlib.suppress(Exception):
+            present = bool(self.deps.container_present())
+
+        adopted = self.adopt_recovery_task()
+
+        self._leases.clear()
+        self._waiters.clear()
+        self._idle_since = None
+        self._drain_requested = False
+        self._drain_reason = None
+        self._pending_unload = False
+
+        if present:
+            # A container we did not load ourselves: surface it instead of
+            # pretending the state is clean.
+            self.lifecycle = Lifecycle.FAULT
+            self.fault_reason = (
+                "container present at startup without an orchestrated load; "
+                "enabled mode requires an unloaded start (R13)"
+            )
+            self.last_error = self.fault_reason
+        else:
+            self.lifecycle = Lifecycle.UNLOADED
+            self.fault_reason = None
+
+        return {
+            "lifecycle": self.lifecycle.value,
+            "container_present": present,
+            "recovery_adopted": adopted,
+            "leases": 0,
+            "pending": 0,
+        }
+
     async def _execute_load(self) -> tuple[bool, Optional[str]]:
         try:
             await self.deps.load_model()

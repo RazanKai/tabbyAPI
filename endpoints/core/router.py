@@ -55,6 +55,7 @@ from endpoints.core.utils.model import (
     stream_model_load,
     _load_tasks,
 )
+from orchestration.errors import orchestration_error
 from orchestration.lifecycle import LifecycleError
 from orchestration.policy import Reason
 
@@ -74,9 +75,10 @@ def _reject_unsupported_surface(name: str) -> None:
     """
 
     if config.orchestrator.enabled:
-        raise HTTPException(
+        raise orchestration_error(
             400,
-            f"unsupported_profile: {name} is rejected in orchestrated mode; "
+            Reason.UNSUPPORTED_PROFILE.value,
+            f"{name} is rejected in orchestrated mode; "
             "LoRA/template mutation and sampler overrides are outside the "
             "calibrated single-profile scope (R12)",
         )
@@ -319,15 +321,16 @@ async def load_model(data: ModelLoadRequest) -> ModelLoadResponse:
 
         configured = config.orchestrator.model.name
         if data.model_name != configured:
-            raise HTTPException(
+            raise orchestration_error(
                 404,
-                f"model_not_configured: {data.model_name!r} is not the configured "
-                f"model ({configured!r})",
+                Reason.MODEL_NOT_CONFIGURED.value,
+                f"{data.model_name!r} is not the configured model ({configured!r})",
             )
         if data.skip_queue:
-            raise HTTPException(
+            raise orchestration_error(
                 400,
-                "unsupported_profile: skip_queue is rejected in orchestrated mode; "
+                Reason.UNSUPPORTED_PROFILE.value,
+                "skip_queue is rejected in orchestrated mode; "
                 "explicit loads use the same admission machinery as inference (R12)",
             )
         # R12/SPEC §2: the orchestrated load uses the CALIBRATED profile only, so
@@ -337,18 +340,26 @@ async def load_model(data: ModelLoadRequest) -> ModelLoadResponse:
         # model in particular is outside V1's calibrated envelope entirely.
         rejected = _load_overrides_rejected(data)
         if rejected is not None:
-            raise HTTPException(400, f"unsupported_profile: {rejected}")
+            raise orchestration_error(400, Reason.UNSUPPORTED_PROFILE.value, rejected)
         coordinator_obj = runtime.orchestrator
         if coordinator_obj is None:
-            raise HTTPException(503, "orchestrator_fault: coordinator is not installed")
+            raise orchestration_error(
+                503,
+                Reason.ORCHESTRATOR_FAULT.value,
+                "coordinator is not installed",
+            )
         try:
             # Reserve the transition (this is the admission boundary for explicit
             # demand). Raises LifecycleError if another transition is active.
             coordinator_obj.reserve_explicit_load()
         except LifecycleError as exc:
-            raise HTTPException(503, f"model_transition: {exc}") from exc
+            raise orchestration_error(
+                503, Reason.MODEL_TRANSITION.value, str(exc), retryable=True
+            ) from exc
         except Exception as exc:
-            raise HTTPException(503, f"gpu_not_quiet: {exc}") from exc
+            raise orchestration_error(
+                503, Reason.GPU_NOT_QUIET.value, str(exc), retryable=True
+            ) from exc
 
         # The load is executed by the coordinator's production deps (same
         # calibrated-envelope kwargs as inference demand) and observed to

@@ -1760,3 +1760,90 @@ def test_review_queued_head_blocker_is_published_in_blockers_too(calibrated_conf
     # The blocker list names the real obstacle (the active-request limit) and the
     # queued-head demotion is consistent with the published reason code.
     assert any("request_capacity" in b for b in status["admission"]["blockers"])
+
+
+# --------------------------------------------------------------------------- #
+# Restart reconciliation (R13)
+# --------------------------------------------------------------------------- #
+
+
+def test_restart_with_a_stray_container_latches_fault_and_blocks_admission(calibrated_config):
+    """R13: residency is READ from the container, never inherited as belief.
+
+    A container that exists at startup without an orchestrated load (an upstream
+    startup load, a dummy model, a leftover from a previous process) means the
+    process is holding unmeasured residency. Publishing UNLOADED and admitting a
+    cold load against it would double-allocate; the honest outcome is FAULT with
+    admission closed and the bypass named.
+    """
+    coord, deps, clock = build(calibrated_config)
+    deps._present = True  # a container exists that this coordinator never loaded
+
+    result = asyncio.run(coord.reconcile_startup())
+
+    assert result["container_present"] is True
+    assert result["lifecycle"] == "FAULT"
+    assert result["leases"] == 0 and result["pending"] == 0
+    status = asyncio.run(coord.status())
+    assert status["lifecycle"] == "FAULT"
+    assert "without an orchestrated load" in status["fault"]
+    denial = asyncio.run(coord.acquire_lease("req-after-restart"))
+    assert denial.outcome is AdmissionOutcome.DENIED
+
+
+def test_restart_clears_leases_and_waiters_and_reads_no_residency(calibrated_config):
+    """R13: "no trusted residency, no leases, no pending requests" after restart."""
+    coord, deps, clock = build(wait_config(calibrated_config, wait_seconds=30.0))
+    elapse_quiet(coord, clock)
+
+    async def go():
+        # Build up believable state: one held lease and one queued waiter.
+        holder = await coord.acquire_lease("holder")
+        queued = asyncio.create_task(coord.acquire_lease("queued"))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert coord._leases and coord._waiters
+        queued.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await queued
+        return holder
+
+    asyncio.run(go())
+    assert coord._leases, "precondition: a lease is outstanding"
+
+    # Model the actual restart: a new process with nothing resident. The lease
+    # table and queue are in-memory only, so the reconciliation must clear them
+    # and publish the state it OBSERVES (no container -> UNLOADED).
+    loads_before = deps.load_count
+    deps._present = False
+    result = asyncio.run(coord.reconcile_startup())
+
+    assert result["leases"] == 0 and result["pending"] == 0
+    assert coord._leases == {} and coord._waiters == []
+    assert result["lifecycle"] == "UNLOADED"
+    assert deps.load_count == loads_before, "reconciliation must not load anything"
+
+
+def test_restart_adopts_a_recovery_already_running(calibrated_config):
+    """R13/F12: a recovery in flight across the startup boundary is observed."""
+    coord, deps, clock = build(calibrated_config)
+
+    async def never_settles():
+        await asyncio.Event().wait()
+
+    async def go():
+        deps.recovery_task = asyncio.get_running_loop().create_task(never_settles())
+        try:
+            result = await coord.reconcile_startup()
+            assert result["recovery_adopted"] is True
+            assert coord._recovery_task is deps.recovery_task
+            # And the protection is live immediately: no teardown under recovery.
+            verdict = await coord.admission_preview()
+            assert verdict["can_admit_now"] is False
+            assert any("model_recovery" in b for b in verdict["blockers"])
+        finally:
+            deps.recovery_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await deps.recovery_task
+
+    asyncio.run(go())

@@ -100,11 +100,11 @@ async def completion_request(request: Request, data: CompletionRequest) -> Compl
             prompts=len(data.prompt) if isinstance(data.prompt, list) else 1,
         )
         if shape_problem is not None:
+            from orchestration.errors import orchestration_error
             from orchestration.policy import Reason
 
-            raise HTTPException(
-                400,
-                f"{Reason.UNSUPPORTED_PROFILE.value}: {shape_problem}",
+            raise orchestration_error(
+                400, Reason.UNSUPPORTED_PROFILE.value, shape_problem
             )
         try:
             lease_ctx = await acquire_lease_now(request.state.id)
@@ -122,9 +122,13 @@ async def completion_request(request: Request, data: CompletionRequest) -> Compl
                 # the narrowly preauthorized configured-profile load (or denied).
                 # This removes the admin-key arbitrary-path bypass entirely.
                 if data.model and data.model != config.orchestrator.model.name:
-                    raise HTTPException(
+                    from orchestration.errors import orchestration_error
+                    from orchestration.policy import Reason
+
+                    raise orchestration_error(
                         404,
-                        f"model_not_configured: {data.model!r} is not the configured "
+                        Reason.MODEL_NOT_CONFIGURED.value,
+                        f"{data.model!r} is not the configured "
                         f"model ({config.orchestrator.model.name!r})",
                     )
                 await check_model_container()
@@ -225,12 +229,10 @@ async def chat_completion_request(
             prompts=1,
         )
         if shape_problem is not None:
+            from orchestration.errors import orchestration_error
             from orchestration.policy import Reason
 
-            raise HTTPException(
-                400,
-                f"{Reason.UNSUPPORTED_PROFILE.value}: {shape_problem}",
-            )
+            raise orchestration_error(400, Reason.UNSUPPORTED_PROFILE.value, shape_problem)
         try:
             lease_ctx = await acquire_lease_now(request.state.id)
         except LeaseDenied as denied:
@@ -247,9 +249,13 @@ async def chat_completion_request(
                 # the narrowly preauthorized configured-profile load (or denied).
                 # This removes the admin-key arbitrary-path bypass entirely.
                 if data.model and data.model != config.orchestrator.model.name:
-                    raise HTTPException(
+                    from orchestration.errors import orchestration_error
+                    from orchestration.policy import Reason
+
+                    raise orchestration_error(
                         404,
-                        f"model_not_configured: {data.model!r} is not the configured "
+                        Reason.MODEL_NOT_CONFIGURED.value,
+                        f"{data.model!r} is not the configured "
                         f"model ({config.orchestrator.model.name!r})",
                     )
                 await check_model_container()

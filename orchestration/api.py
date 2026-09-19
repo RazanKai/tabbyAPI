@@ -27,6 +27,12 @@ from pydantic import BaseModel, Field
 
 from common.auth import check_admin_key
 from common.logger import xlogger
+from orchestration.errors import (
+    RETRY_AFTER_SECONDS,
+    OrchestrationHTTPException,
+    error_content,
+    orchestration_error,
+)
 from orchestration.policy import Reason
 
 router = APIRouter()
@@ -35,33 +41,12 @@ router = APIRouter()
 #: missing here is a programming error, not a 500 waiting to happen: ``_status_for``
 #: returns 503 for anything unknown so an unmapped reason degrades to the generic
 #: "pre-admission unavailable" bucket rather than leaking a wrong status.
-_RETRY_AFTER_SECONDS = 5
+_RETRY_AFTER_SECONDS = RETRY_AFTER_SECONDS
 
 _ADMISSION_TIMEOUT = "admission_timeout"
 _QUEUE_FULL = "admission_queue_full"
 _UNSUPPORTED_PROFILE = "unsupported_profile"
 _MODEL_NOT_CONFIGURED = "model_not_configured"
-
-
-def error_content(code: str, message: str, *, retryable: bool = False) -> dict:
-    """Build the stable orchestration error body.
-
-    Mirrors ``common/errors.py:context_length_error_content`` so orchestration errors
-    look like every other structured error this server already emits, rather than
-    introducing a third shape.
-    """
-
-    body = {
-        "error": {
-            "message": message,
-            "type": "orchestrator_error",
-            "param": None,
-            "code": code,
-        }
-    }
-    if retryable:
-        body["error"]["retry_after_seconds"] = _RETRY_AFTER_SECONDS
-    return body
 
 
 def status_for(reason: Reason) -> int:
@@ -107,6 +92,11 @@ def admission_http_exception(result, *, message: Optional[str] = None) -> HTTPEx
     error body is their *only* channel for learning why they were refused, and
     "insufficient_vram" vs "external_gpu_busy" determines whether retrying is
     reasonable at all. Omitting the code would leave them with prose.
+
+    The returned exception is an :class:`~orchestration.errors.OrchestrationHTTPException`
+    so the body is R12's structured shape (``{"error": {..., "code": ...}}``) rather
+    than a bare ``{"detail": ...}``; it still *is* an ``HTTPException``, so every
+    existing raise/except site is unchanged.
     """
 
     reason = result.reason if result.reason is not None else Reason.OK
@@ -122,9 +112,9 @@ def admission_http_exception(result, *, message: Optional[str] = None) -> HTTPEx
             detail = "; ".join(relevant)
     if code not in detail:
         detail = f"{code}: {detail}" if detail else code
-    exc = HTTPException(status_for(reason), detail)
-    exc.headers = {"Retry-After": str(_RETRY_AFTER_SECONDS)} if is_temporary(reason) else None
-    return exc
+    return OrchestrationHTTPException(
+        status_for(reason), code, detail, retryable=is_temporary(reason)
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -182,9 +172,10 @@ def _coordinator_or_503(request: Request):
 
     coordinator = runtime.orchestrator
     if coordinator is None:
-        raise HTTPException(
+        raise orchestration_error(
             status_for(Reason.ORCHESTRATOR_FAULT),
-            f"Orchestrator is not installed in this process ({Reason.ORCHESTRATOR_FAULT.value})",
+            Reason.ORCHESTRATOR_FAULT.value,
+            "Orchestrator is not installed in this process",
         )
     return coordinator
 
