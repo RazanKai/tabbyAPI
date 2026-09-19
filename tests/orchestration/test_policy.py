@@ -448,3 +448,48 @@ def test_policy_config_validation_flags_ordering():
     errors = ew_config(process_vram_release_bytes=9999 * MIB).validate()
     assert any("process_vram_release_mib" in e for e in errors)
     assert cold_config(max_device_utilization_percent=101).validate()
+
+
+def test_shipped_defaults_match_the_committed_r04_calibration():
+    """M4.2 / R04: the shipped threshold defaults ARE the committed calibration.
+
+    The M4.13 review found the calibration numbers living only in the workspace
+    artefact and the WORKLOG prose: the code still carried the pre-calibration
+    candidates, so every "calibrated" acceptance run was measured against
+    thresholds nobody had validated, and nothing in the suite could notice.
+
+    This binds the two authorities. It reads the calibration artefact from the
+    development workspace (``<workspace>/evidence/m4-calibration/
+    r04-threshold-aggregate-v2.json``, i.e. two levels above this checkout) rather
+    than embedding host measurements in the published tree, and skips with a stated
+    reason when the workspace is absent — a skip here means "no authority to
+    compare against", never "the numbers are fine".
+    """
+
+    import json
+    import pathlib
+
+    # <workspace>/fork/tabbyAPI/tests/orchestration/test_policy.py
+    workspace = pathlib.Path(__file__).resolve().parents[4]
+    artefact = workspace / "evidence" / "m4-calibration" / "r04-threshold-aggregate-v2.json"
+    if not artefact.is_file():
+        pytest.skip(f"no calibration artefact at {artefact}; nothing to bind against")
+
+    recommended = json.loads(artefact.read_text())["recommended_thresholds"]
+    shipped = OrchestratorConfig().external_workload
+
+    pairs = {
+        "process_vram_enter_mib": shipped.process_vram_enter_mib,
+        "process_vram_release_mib": shipped.process_vram_release_mib,
+        "total_vram_enter_mib": shipped.total_vram_enter_mib,
+        "total_vram_release_mib": shipped.total_vram_release_mib,
+        "process_activity_enter_percent": shipped.process_activity_enter_percent,
+        "process_activity_release_percent": shipped.process_activity_release_percent,
+    }
+    mismatched = {
+        key: (value, recommended[key]) for key, value in pairs.items() if value != recommended[key]
+    }
+    assert not mismatched, (
+        "shipped defaults disagree with the committed R04 calibration "
+        f"(shipped, committed): {mismatched}"
+    )

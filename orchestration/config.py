@@ -118,24 +118,32 @@ class OrchestratorColdLoadConfig(_Base):  # type: ignore[misc,valid-type]
 
 
 class OrchestratorExternalWorkloadConfig(_Base):  # type: ignore[misc,valid-type]
-    """Candidate thresholds for the external-workload priority veto.
+    """External-workload priority thresholds, carrying the committed R04 calibration.
 
-    These are *candidate test settings*, not measured gaming thresholds. Release
-    values must exceed the measured normal-desktop peaks plus a stated margin
-    (SPEC R04), and same-metric calibration is an M0 gate.
+    These defaults are NOT candidate guesses: they are the calibration committed by
+    M4.2 from measured traces on the target host (worst normal-desktop single
+    process 596 MiB, desktop aggregate max 1058 MiB, lowest target-workload floor
+    1488 MiB). `orchestration/config.py` and
+    `evidence/m4-calibration/r04-threshold-aggregate-v2.json` must agree on every
+    number here — `tests/orchestration/test_policy.py` binds the two, because a
+    calibration that is committed to a document but not to the shipped defaults is
+    the defect this test exists to prevent.
+
+    A different host must recalibrate (SPEC R04) and update the artefact and these
+    defaults together.
     """
 
     process_vram_enter_mib: int = Field(
-        1024, ge=0, description="Largest single external process VRAM that asserts priority."
+        1152, ge=0, description="Largest single external process VRAM that asserts priority."
     )
     process_vram_release_mib: int = Field(
-        768, ge=0, description="Largest single external process VRAM below which the memory trigger clears."
+        896, ge=0, description="Largest single external process VRAM below which the memory trigger clears."
     )
     total_vram_enter_mib: int = Field(
-        2304, ge=0, description="Aggregate external VRAM that asserts priority."
+        1984, ge=0, description="Aggregate external VRAM that asserts priority."
     )
     total_vram_release_mib: int = Field(
-        1792, ge=0, description="Aggregate external VRAM below which the memory trigger clears."
+        1600, ge=0, description="Aggregate external VRAM below which the memory trigger clears."
     )
     process_activity_enter_percent: int = Field(
         25, ge=0, le=100, description="Per-process SM activity that asserts priority."
